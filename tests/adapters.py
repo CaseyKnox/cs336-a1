@@ -589,4 +589,80 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    import regex as re # lazy import
+    import multiprocessing as mp
+    from cs336_basics.pretokenization_example import find_chunk_boundaries
+    from collections import defaultdict
+
+    pre_tok_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    special_tokens_esc = [re.escape(tok) for tok in special_tokens]
+    special_token_pat = f"({'|'.join(special_tokens_esc)})"
+
+    n_proc = mp.cpu_count() - 1
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, n_proc, special_tokens[0].encode("utf-8"))
+
+        # 1. pre-tokenization
+        pre_tok: dict[tuple[bytes, ...], int] = defaultdict(int) 
+        for start, end in zip(boundaries, boundaries[1:]):
+            f.seek(start)
+
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+            docs = re.split(special_token_pat, chunk)
+
+            for doc in docs:
+                # don't split up special tokens
+                if doc in special_tokens:
+                    pre_tok[tuple((doc.encode(),))] += 1
+                    continue
+                matches = re.finditer(pre_tok_pat, doc)
+                for match in matches:
+                    tok = doc[match.start():match.end()]
+                    tok_enc = tok.encode('utf-8')
+                    pre_tok[tuple([bytes([i]) for i in tok_enc])] += 1
+
+        # 2. merges
+        merges = []
+        for i in range(vocab_size - 256 - len(special_tokens)):
+            bp_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+            max_bp = None
+            for tok, count in pre_tok.items():
+                for pair in zip(tok, tok[1:]):
+                    bp_counts[pair] += count
+                    if not max_bp or bp_counts[pair] > bp_counts[max_bp]:
+                        max_bp = pair
+                    elif bp_counts[pair] == bp_counts[max_bp]:
+                        max_bp = max(pair, max_bp)
+
+            merges.append(tuple(max_bp))
+            # update pre_tok keys
+            new_pre_tok = dict()
+            for key, count in list(pre_tok.items()):
+                new_key = []
+                i = 0
+                while i < len(key):
+                    if i < len(key) - 1 and (key[i], key[i+1]) == max_bp:
+                        merged_tok = key[i] + key[i+1]
+                        new_key.append(merged_tok)
+                        i += 2
+                    else:
+                        new_key.append(key[i])
+                        i+= 1
+
+                new_pre_tok[tuple(new_key)] = count
+
+            pre_tok = new_pre_tok
+
+        # 3. assemble vocab
+        vocab = []
+        vocab.extend([tok.encode('utf-8') for tok in special_tokens])
+        vocab.extend([bytes([i]) for i in range(256)])
+        for merge in merges:
+            merge_joined = b''.join(merge)
+            vocab.append(merge_joined)
+
+        vocab_dict = {i : v for i, v in enumerate(vocab)}
+
+        return vocab_dict, merges
