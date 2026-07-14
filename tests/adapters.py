@@ -624,36 +624,58 @@ def run_train_bpe(
                     pre_tok[tuple([bytes([i]) for i in tok_enc])] += 1
 
         # 2. merges
+        bp_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+        pair_to_words = defaultdict(set)
+        for tok, count in pre_tok.items():
+            for pair in zip(tok, tok[1:]):
+                bp_counts[pair] += count
+                pair_to_words[pair].add(tok)
+
         merges = []
         for i in range(vocab_size - 256 - len(special_tokens)):
-            bp_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
-            max_bp = None
-            for tok, count in pre_tok.items():
-                for pair in zip(tok, tok[1:]):
-                    bp_counts[pair] += count
-                    if not max_bp or bp_counts[pair] > bp_counts[max_bp]:
-                        max_bp = pair
-                    elif bp_counts[pair] == bp_counts[max_bp]:
-                        max_bp = max(pair, max_bp)
+            # Max based on value, or key if a tie
+            max_bp = max(bp_counts.items(), key=lambda x: (x[1], x[0]))[0]
 
             merges.append(tuple(max_bp))
-            # update pre_tok keys
-            new_pre_tok = dict()
-            for key, count in list(pre_tok.items()):
-                new_key = []
+
+            # Create a snapshot of the set so we don't modify it while iterating
+            words_to_update = list(pair_to_words[max_bp]) 
+
+            for old_word in words_to_update:
+                count = pre_tok[old_word]
+                
+                # 1. Tear down the old pairs
+                for pair in zip(old_word, old_word[1:]):
+                    bp_counts[pair] -= count
+                    pair_to_words[pair].discard(old_word) # discard is safe if element doesn't exist
+                    
+                    # Optional but recommended: keep dictionaries lean
+                    if bp_counts[pair] <= 0:
+                        del bp_counts[pair]
+
+                # 2. Build the new word
+                new_word = []
                 i = 0
-                while i < len(key):
-                    if i < len(key) - 1 and (key[i], key[i+1]) == max_bp:
-                        merged_tok = key[i] + key[i+1]
-                        new_key.append(merged_tok)
+                while i < len(old_word):
+                    if i < len(old_word) - 1 and (old_word[i], old_word[i+1]) == max_bp:
+                        merged_tok = old_word[i] + old_word[i+1]
+                        new_word.append(merged_tok)
                         i += 2
                     else:
-                        new_key.append(key[i])
-                        i+= 1
+                        new_word.append(old_word[i])
+                        i += 1
+                
+                new_word = tuple(new_word)
 
-                new_pre_tok[tuple(new_key)] = count
+                # 3. Set up the new pairs
+                for pair in zip(new_word, new_word[1:]):
+                    bp_counts[pair] += count
+                    pair_to_words[pair].add(new_word)
 
-            pre_tok = new_pre_tok
+                # 4. Update the main vocab tracker
+                pre_tok[new_word] = count
+                del pre_tok[old_word]
+
 
         # 3. assemble vocab
         vocab = []
