@@ -9,6 +9,10 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from collections import defaultdict
+import regex as re
+import multiprocessing as mp
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 def run_linear(
     d_in: int,
@@ -562,6 +566,29 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+def _process_chunk(input_path, start, end, special_tokens, pre_tok_pat, special_token_pat):
+    pre_tok: dict[tuple[bytes, ...], int] = defaultdict(int) 
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    docs = re.split(special_token_pat, chunk)
+
+    for doc in docs:
+        # don't split up special tokens
+        if doc in special_tokens:
+            pre_tok[tuple((doc.encode(),))] += 1
+            continue
+        matches = re.finditer(pre_tok_pat, doc)
+        for match in matches:
+            tok = doc[match.start():match.end()]
+            tok_enc = tok.encode('utf-8')
+            pre_tok[tuple([bytes([i]) for i in tok_enc])] += 1
+
+    return pre_tok
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,10 +616,6 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    import regex as re # lazy import
-    import multiprocessing as mp
-    from cs336_basics.pretokenization_example import find_chunk_boundaries
-    from collections import defaultdict
 
     pre_tok_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -603,88 +626,89 @@ def run_train_bpe(
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, n_proc, special_tokens[0].encode("utf-8"))
 
+    file_size = os.path.getsize(input_path)
+    min_size = 5 * 1024 * 1024 # 5MB
+
+    # Use serial for small files
+    if file_size < min_size:
+        pre_tok = _process_chunk(input_path, 0, file_size, special_tokens, pre_tok_pat, special_token_pat)
+    else:
+        chunk_args = [
+            (input_path, start, end, special_tokens, pre_tok_pat, special_token_pat)
+            for start, end in zip(boundaries, boundaries[1:])
+        ]
         # 1. pre-tokenization
+        with mp.Pool(n_proc) as p:
+            res = p.starmap(_process_chunk, chunk_args)
+        
+        # merge pre-tok dictionaries
         pre_tok: dict[tuple[bytes, ...], int] = defaultdict(int) 
-        for start, end in zip(boundaries, boundaries[1:]):
-            f.seek(start)
+        for partial_dict in res:
+            for key, count in partial_dict.items():
+                pre_tok[key] += count
 
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    # 2. merges
+    bp_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    pair_to_words = defaultdict(set)
+    for tok, count in pre_tok.items():
+        for pair in zip(tok, tok[1:]):
+            bp_counts[pair] += count
+            pair_to_words[pair].add(tok)
 
-            docs = re.split(special_token_pat, chunk)
+    merges = []
+    for i in range(vocab_size - 256 - len(special_tokens)):
+        # Max based on value, or key if a tie
+        max_bp = max(bp_counts.items(), key=lambda x: (x[1], x[0]))[0]
 
-            for doc in docs:
-                # don't split up special tokens
-                if doc in special_tokens:
-                    pre_tok[tuple((doc.encode(),))] += 1
-                    continue
-                matches = re.finditer(pre_tok_pat, doc)
-                for match in matches:
-                    tok = doc[match.start():match.end()]
-                    tok_enc = tok.encode('utf-8')
-                    pre_tok[tuple([bytes([i]) for i in tok_enc])] += 1
+        merges.append(tuple(max_bp))
 
-        # 2. merges
-        bp_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
-        pair_to_words = defaultdict(set)
-        for tok, count in pre_tok.items():
-            for pair in zip(tok, tok[1:]):
+        # Create a snapshot of the set so we don't modify it while iterating
+        words_to_update = list(pair_to_words[max_bp]) 
+
+        for old_word in words_to_update:
+            count = pre_tok[old_word]
+            
+            # 1. Tear down the old pairs
+            for pair in zip(old_word, old_word[1:]):
+                bp_counts[pair] -= count
+                pair_to_words[pair].discard(old_word) # discard is safe if element doesn't exist
+                
+                # Optional but recommended: keep dictionaries lean
+                if bp_counts[pair] <= 0:
+                    del bp_counts[pair]
+
+            # 2. Build the new word
+            new_word = []
+            i = 0
+            while i < len(old_word):
+                if i < len(old_word) - 1 and (old_word[i], old_word[i+1]) == max_bp:
+                    merged_tok = old_word[i] + old_word[i+1]
+                    new_word.append(merged_tok)
+                    i += 2
+                else:
+                    new_word.append(old_word[i])
+                    i += 1
+            
+            new_word = tuple(new_word)
+
+            # 3. Set up the new pairs
+            for pair in zip(new_word, new_word[1:]):
                 bp_counts[pair] += count
-                pair_to_words[pair].add(tok)
+                pair_to_words[pair].add(new_word)
 
-        merges = []
-        for i in range(vocab_size - 256 - len(special_tokens)):
-            # Max based on value, or key if a tie
-            max_bp = max(bp_counts.items(), key=lambda x: (x[1], x[0]))[0]
-
-            merges.append(tuple(max_bp))
-
-            # Create a snapshot of the set so we don't modify it while iterating
-            words_to_update = list(pair_to_words[max_bp]) 
-
-            for old_word in words_to_update:
-                count = pre_tok[old_word]
-                
-                # 1. Tear down the old pairs
-                for pair in zip(old_word, old_word[1:]):
-                    bp_counts[pair] -= count
-                    pair_to_words[pair].discard(old_word) # discard is safe if element doesn't exist
-                    
-                    # Optional but recommended: keep dictionaries lean
-                    if bp_counts[pair] <= 0:
-                        del bp_counts[pair]
-
-                # 2. Build the new word
-                new_word = []
-                i = 0
-                while i < len(old_word):
-                    if i < len(old_word) - 1 and (old_word[i], old_word[i+1]) == max_bp:
-                        merged_tok = old_word[i] + old_word[i+1]
-                        new_word.append(merged_tok)
-                        i += 2
-                    else:
-                        new_word.append(old_word[i])
-                        i += 1
-                
-                new_word = tuple(new_word)
-
-                # 3. Set up the new pairs
-                for pair in zip(new_word, new_word[1:]):
-                    bp_counts[pair] += count
-                    pair_to_words[pair].add(new_word)
-
-                # 4. Update the main vocab tracker
-                pre_tok[new_word] = count
-                del pre_tok[old_word]
+            # 4. Update the main vocab tracker
+            pre_tok[new_word] = count
+            del pre_tok[old_word]
 
 
-        # 3. assemble vocab
-        vocab = []
-        vocab.extend([tok.encode('utf-8') for tok in special_tokens])
-        vocab.extend([bytes([i]) for i in range(256)])
-        for merge in merges:
-            merge_joined = b''.join(merge)
-            vocab.append(merge_joined)
+    # 3. assemble vocab
+    vocab = []
+    vocab.extend([tok.encode('utf-8') for tok in special_tokens])
+    vocab.extend([bytes([i]) for i in range(256)])
+    for merge in merges:
+        merge_joined = b''.join(merge)
+        vocab.append(merge_joined)
 
-        vocab_dict = {i : v for i, v in enumerate(vocab)}
+    vocab_dict = {i : v for i, v in enumerate(vocab)}
 
-        return vocab_dict, merges
+    return vocab_dict, merges
