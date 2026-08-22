@@ -2,6 +2,8 @@ import einops
 import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float, Int
+from collections.abc import Callable, Iterable
+from typing import Optional
 
 class Linear(nn.Module):
     def __init__(self, in_feat, out_feat, device=None, dtype=None):
@@ -266,3 +268,70 @@ def calculate_flops(batch, seq_len, d_model, d_ff, vocab_size, n_blocks):
     lm_head = 2 * batch * seq_len * vocab_size * d_model
 
     return n_blocks * block + lm_head
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    logits: output from model of shape (B, seq, vocab_size)
+    targets: expected output of shape (B, seq)
+
+    returns cross entropy of shape (B, 1)
+    """
+    # Subtract the maximum for stability
+    # All exp(x) will fall in (0,1] since x_i <= 0
+    c = torch.amax(logits, -1, keepdim=True)
+    logits = logits - c
+
+    # log rules cancel out the numerator and becomes subtraction
+    # ln(e(x)) = x
+    # ln(x/y) = ln(x) - ln(y)
+    # equation becomes x - denom
+    denom = torch.log(torch.sum(torch.exp(logits), -1, keepdim=True))
+
+    logits_plucked = logits.gather(-1, targets.unsqueeze(-1))
+    return -(logits_plucked - denom).mean()
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr, weight_decay, betas, eps):
+        if lr < 0:
+            raise ValueError(f"Invalid alpha: {lr}")
+        defaults = {
+            "a" : lr,
+            "b1" : betas[0],
+            "b2" : betas[1],
+            "eps" : eps,
+            "l" : weight_decay
+        }
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            a = group["a"]
+            b1 = group["b1"]
+            b2 = group["b2"]
+            eps = group["eps"]
+            l = group["l"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                # Extract values
+                state = self.state[p]
+                t = state.get("t", 1)
+                m = state.get("m", 0)
+                v = state.get("v", 0)
+                grad = p.grad.data # grad of loss wrt p
+
+                # Algorithm
+                a_t = a * (1 - b2**t)**0.5 / (1-b1**t)
+                p.data -= a * l * p.data
+                m = b1 * m + (1 - b1) * grad
+                v = b2 * v + (1 - b2) * grad**2
+                p.data -= a_t * m / (v**0.5 + eps)
+
+                # Save
+                state["t"] = t + 1
+                state["m"] = m
+                state["v"] = v
+
+        return loss
