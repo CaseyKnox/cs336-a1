@@ -13,6 +13,9 @@ from collections import defaultdict
 import regex as re
 import multiprocessing as mp
 from cs336_basics.pretokenization_example import find_chunk_boundaries
+from tqdm import tqdm
+import einops
+from cs336_basics.modules import Linear, Embedding, RMSNorm, SwiGLU, RoPE, MultiHeadAttention, TransformerBlock, LM
 
 def run_linear(
     d_in: int,
@@ -32,9 +35,13 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    linear_model = Linear(d_in, d_out)
+    state_dict = {
+        "weights" : weights
+    }
+    linear_model.load_state_dict(state_dict)
 
-    raise NotImplementedError
-
+    return linear_model.forward(in_features)
 
 def run_embedding(
     vocab_size: int,
@@ -54,8 +61,13 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    emb = Embedding(vocab_size, d_model)
+    state_dict = {
+        "embedding" : weights
+    }
+    emb.load_state_dict(state_dict)
 
-    raise NotImplementedError
+    return emb.forward(token_ids)
 
 
 def run_swiglu(
@@ -87,7 +99,13 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = SwiGLU(d_model, d_ff)
+    swiglu.load_state_dict({
+        "w1" : w1_weight,
+        "w2" : w2_weight,
+        "w3" : w3_weight,
+    })
+    return swiglu.forward(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -108,7 +126,13 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d = Q.shape[-1]
+    qk = torch.einsum("... q d, ... k d -> ... q k", Q, K) / (d**0.5)
+    if mask is not None:
+        qk = torch.where(mask, qk, -torch.inf)
+    softmax = run_softmax(qk, -1) # softmax along keys
+    qkv = torch.einsum("... q k, ... k d -> ... q d", softmax, V)
+    return qkv
 
 
 def run_multihead_self_attention(
@@ -142,7 +166,14 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attn = MultiHeadAttention(d_model, num_heads)
+    attn.load_state_dict(
+        {"Q" : q_proj_weight,
+         "K" : k_proj_weight,
+         "V" : v_proj_weight,
+         "O" : o_proj_weight}
+    )
+    return attn(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -204,7 +235,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RoPE(theta, d_k, max_seq_len)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -277,7 +309,20 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    tfb = TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len)
+    tfb.load_state_dict(
+    {
+        "attn.Q" : weights["attn.q_proj.weight"],
+        "attn.K" : weights["attn.k_proj.weight"],
+        "attn.V" : weights["attn.v_proj.weight"],
+        "attn.O" : weights["attn.output_proj.weight"],
+        "rms.g" : weights["ln1.weight"],
+        "rms2.g" : weights["ln2.weight"],
+        "swiglu.w1" : weights["ffn.w1.weight"],
+        "swiglu.w2" : weights["ffn.w2.weight"],
+        "swiglu.w3" : weights["ffn.w3.weight"],
+    })
+    return tfb(in_features)
 
 
 def run_transformer_lm(
@@ -359,7 +404,19 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    lm = LM(
+        vocab_size=vocab_size,
+        max_seq_len=context_length, 
+        n_layers=num_layers,
+        n_heads=num_heads,
+        d_model=d_model,
+        d_ff=d_ff,
+        theta=rope_theta
+    )
+    lm.load_state_dict({
+        "emb.embedding" : weights["token_embeddings.weight"],
+        ""
+    })
 
 
 def run_rmsnorm(
@@ -382,7 +439,13 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rms = RMSNorm(d_model, eps)
+    state_dict = {
+        "g" : weights
+    }
+    rms.load_state_dict(state_dict)
+
+    return rms.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -435,7 +498,14 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    # Softmax is invariant to constants. 
+    # Remove the max for numerical stability
+    dim_max = torch.amax(in_features, dim=dim, keepdim=True)
+
+    in_feat_offset = in_features - dim_max
+
+    exp = torch.exp(in_feat_offset)
+    return exp / torch.sum(exp, dim=dim, keepdim=True)
 
 
 def run_cross_entropy(
@@ -638,7 +708,7 @@ def run_train_bpe(
             for start, end in zip(boundaries, boundaries[1:])
         ]
         # 1. pre-tokenization
-        with mp.Pool(n_proc) as p:
+        with mp.Pool(n_proc - 1) as p:
             res = p.starmap(_process_chunk, chunk_args)
         
         # merge pre-tok dictionaries
@@ -656,7 +726,8 @@ def run_train_bpe(
             pair_to_words[pair].add(tok)
 
     merges = []
-    for i in range(vocab_size - 256 - len(special_tokens)):
+    target_merges = vocab_size - 256 - len(special_tokens)
+    for i in tqdm(range(target_merges), desc="Training BPE Merges", unit="merge"):
         # Max based on value, or key if a tie
         max_bp = max(bp_counts.items(), key=lambda x: (x[1], x[0]))[0]
 
