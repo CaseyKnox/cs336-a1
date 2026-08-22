@@ -245,9 +245,9 @@ class LM(nn.Module):
         """
         super().__init__()
         self.emb = Embedding(vocab_size, d_model, device, dtype)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff, theta, max_seq_len, device, dtype)] * n_layers)
+        self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff, theta, max_seq_len, device, dtype) for _ in range(n_layers)])
         self.norm = RMSNorm(d_model, device=device, dtype=dtype)
-        self.linear = Linear(d_model, d_model)
+        self.linear = Linear(d_model, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.emb(x) # (B, S, D)
@@ -257,4 +257,12 @@ class LM(nn.Module):
 
         x = self.norm(x) # B S D
         x = self.linear(x) # B S D
-        return torch.softmax(x, -1)
+        return x
+        # return torch.softmax(x, -1)
+
+def calculate_flops(batch, seq_len, d_model, d_ff, vocab_size, n_blocks):
+    block = 8 * batch * seq_len * d_model**2 + 4 * batch * seq_len**2 * d_model + 6 * batch * seq_len * d_ff * d_model
+
+    lm_head = 2 * batch * seq_len * vocab_size * d_model
+
+    return n_blocks * block + lm_head

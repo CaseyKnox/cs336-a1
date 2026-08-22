@@ -15,7 +15,17 @@ import multiprocessing as mp
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from tqdm import tqdm
 import einops
-from cs336_basics.modules import Linear, Embedding, RMSNorm, SwiGLU, RoPE, MultiHeadAttention, TransformerBlock, LM
+from cs336_basics.modules import (
+    Linear, 
+    Embedding, 
+    RMSNorm, 
+    SwiGLU, 
+    RoPE, 
+    MultiHeadAttention, 
+    TransformerBlock, 
+    LM,
+    calculate_flops
+)
 
 def run_linear(
     d_in: int,
@@ -413,10 +423,54 @@ def run_transformer_lm(
         d_ff=d_ff,
         theta=rope_theta
     )
-    lm.load_state_dict({
-        "emb.embedding" : weights["token_embeddings.weight"],
-        ""
-    })
+    print(f"vocab_size : {vocab_size}")
+    print(f"ctx : {context_length}")
+    print(f"n layers : {num_layers}")
+    print(f"n_heads : {num_heads}")
+    print(f"d_model : {d_model}")
+    print(f"d_ff : {d_ff}")
+    print(f"theta : {rope_theta}")
+
+    # Total parameters:
+    total_params = sum(p.numel() for p in lm.parameters())
+    
+    # Trainable parameters only:
+    trainable_params = sum(p.numel() for p in lm.parameters() if p.requires_grad)
+    print(f"Total Params: \t\t{total_params}")
+    print(f"Trainable Params: \t{trainable_params}")
+
+    flops = calculate_flops(1, context_length, d_model, d_ff, vocab_size, num_layers)
+    print(f"Flops : {flops}")
+
+    gpt2s_flops = calculate_flops(1, 1024, 768, 8*768//3, 50257, 12)
+    gpt2m_flops = calculate_flops(1, 1024, 1024, 8*1024//3, 50257, 24)
+    gpt2l_flops = calculate_flops(1, 1024, 1280, 8*1280//3, 50257, 36)
+    gpt2xl_flops = calculate_flops(1, 1024, 1600, 4288, 50257, 48)
+    gpt2xlctx_flops = calculate_flops(1, 16384, 1600, 4288, 50257, 48)
+    print(f"gpt2s_flops : {gpt2s_flops*1e-9}")
+    print(f"gpt2m_flops : {gpt2m_flops*1e-9}")
+    print(f"gpt2l_flops : {gpt2l_flops*1e-9}")
+    print(f"gpt2xl_flops : {gpt2xl_flops*1e-9}")
+    print(f"gpt2xlctx_flops : {gpt2xlctx_flops*1e-9}")
+
+    state_dict = {
+        "emb.embedding": weights["token_embeddings.weight"],
+        "norm.g": weights["ln_final.weight"],
+        "linear.weights": weights["lm_head.weight"],
+    }
+    for i in range(num_layers):
+        state_dict[f"blocks.{i}.attn.Q"] = weights[f"layers.{i}.attn.q_proj.weight"]
+        state_dict[f"blocks.{i}.attn.K"] = weights[f"layers.{i}.attn.k_proj.weight"]
+        state_dict[f"blocks.{i}.attn.V"] = weights[f"layers.{i}.attn.v_proj.weight"]
+        state_dict[f"blocks.{i}.attn.O"] = weights[f"layers.{i}.attn.output_proj.weight"]
+        state_dict[f"blocks.{i}.rms.g"] = weights[f"layers.{i}.ln1.weight"]
+        state_dict[f"blocks.{i}.rms2.g"] = weights[f"layers.{i}.ln2.weight"]
+        state_dict[f"blocks.{i}.swiglu.w1"] = weights[f"layers.{i}.ffn.w1.weight"]
+        state_dict[f"blocks.{i}.swiglu.w2"] = weights[f"layers.{i}.ffn.w2.weight"]
+        state_dict[f"blocks.{i}.swiglu.w3"] = weights[f"layers.{i}.ffn.w3.weight"]
+
+    lm.load_state_dict(state_dict)
+    return lm(in_indices)
 
 
 def run_rmsnorm(
