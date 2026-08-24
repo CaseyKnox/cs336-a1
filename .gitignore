@@ -166,3 +166,4 @@ data/*
 .DS_Store
 
 *.prof
+*tmp.py*

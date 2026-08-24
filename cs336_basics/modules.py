@@ -1,6 +1,7 @@
 import einops
 import torch
 import torch.nn as nn
+import math
 from jaxtyping import Bool, Float, Int
 from collections.abc import Callable, Iterable
 from typing import Optional
@@ -258,7 +259,7 @@ class LM(nn.Module):
             x = block(x) # (B S D)
 
         x = self.norm(x) # B S D
-        x = self.linear(x) # B S D
+        x = self.linear(x) # B S V
         return x
         # return torch.softmax(x, -1)
 
@@ -287,7 +288,7 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     # equation becomes x - denom
     denom = torch.log(torch.sum(torch.exp(logits), -1, keepdim=True))
 
-    logits_plucked = logits.gather(-1, targets.unsqueeze(-1))
+    logits_plucked = logits.gather(-1, targets.unsqueeze(-1)) # (B, S)
     return -(logits_plucked - denom).mean()
 
 class AdamW(torch.optim.Optimizer):
@@ -335,3 +336,58 @@ class AdamW(torch.optim.Optimizer):
                 state["v"] = v
 
         return loss
+
+def calculate_activations(b,h,s,d,d_f,v,n):
+    return n *(8*b*s*d + 2*b*h*s**2 + 4*b*s*d_f) + b*s*d + b*s + b*s*v
+
+def calc_params(d,d_f,v,n):
+    return d * (2*v + n*(2+4*d+3*d_f) + 1)
+
+def calc_grads(d,d_f,v,n):
+    return calc_params(d,d_f,v,n)
+
+def calc_optim(d,d_f,v,n):
+    return 2 * calc_params(d,d_f,v,n)
+
+def calc_total_memory(b,h,s,d,d_f,v,n):
+    total = calculate_activations(b,h,s,d,d_f,v,n) + calc_params(d,d_f,v,n) + calc_grads(d,d_f,v,n) + calc_optim(d,d_f,v,n)
+    return total
+
+def get_lr_cosine_schedule(
+    t: int,
+    amax: float,
+    amin: float,
+    t_warm: int,
+    t_c: int,
+):
+    # warm-up
+    if t < t_warm:
+        return t / t_warm * amax
+    elif t_warm <= t <= t_c:
+        # cosine annealing phase
+        return amin + 0.5 * (1 + math.cos((t-t_warm) / (t_c - t_warm) * math.pi)) * (amax - amin)
+    else:
+        # post annealing
+        return amin
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> None:
+    parameters = list(parameters)
+    # Calculate the l2 norm of "g" the concat of all p.grad
+    with torch.no_grad():
+        norm = 0
+        for p in parameters:
+            if p.grad is None:
+                continue
+            norm += torch.sum(p.grad**2)
+        norm = torch.sqrt(norm)
+
+        # Do nothing
+        if norm < max_l2_norm:
+            return
+
+        # Clip the grads
+        scale = max_l2_norm / (norm + eps)
+        for p in parameters:
+            if p.grad is None:
+                continue
+            p.grad *= scale
