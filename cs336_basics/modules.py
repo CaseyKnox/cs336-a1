@@ -1,4 +1,5 @@
 import einops
+import numpy as np
 import torch
 import torch.nn as nn
 import math
@@ -391,3 +392,11 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
             if p.grad is None:
                 continue
             p.grad *= scale
+
+def load(x: np.ndarray, batch: int, ctx: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    starts = torch.randint(0, len(x) - ctx, (batch,1)) # (batch,1)
+    offsets = torch.arange(0, ctx).unsqueeze(0) # (1,ctx)
+    idxs = (starts + offsets).to(torch.int) # (batch,ctx)
+    in_seq = torch.from_numpy(x[idxs]).to(device)
+    out_seq = torch.from_numpy(x[idxs+1]).to(device)
+    return (in_seq, out_seq)
