@@ -3,9 +3,130 @@ import numpy as np
 import torch
 import torch.nn as nn
 import math
+import regex as re
+
 from jaxtyping import Bool, Float, Int
 from collections.abc import Callable, Iterable
-from typing import Optional
+from typing import Optional, Iterator
+from dataclasses import dataclass, asdict
+
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens: list[str] | None = None):
+        """
+        vocab: dict[int, bytes] 
+        merges: list[tuple[bytes, bytes]]
+        special_tokens: list[str] | None
+        """
+        self.vocab = vocab
+        self.bytes_to_int = {v : k for k, v in self.vocab.items()}
+        self.merges = merges
+        self.rank_pair = {pair : rank for rank, pair in enumerate(merges)}
+        self.special_tokens = [] if special_tokens is None else special_tokens
+        self.special_tokens.sort(key=len, reverse=True)
+        self.special_token_pat = None
+        if len(self.special_tokens) > 0:
+            special_tokens_esc = [re.escape(tok) for tok in self.special_tokens]
+            self.special_token_pat = f"({'|'.join(special_tokens_esc)})"
+        self.pre_tok_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None) -> "Tokenizer":
+        with open(vocab_filepath, "r") as f:
+            vocab = f.read()
+        with open(merges_filepath, "r") as f:
+            merges = f.read()
+        return Tokenizer(vocab, merges, special_tokens)
+
+    def _words(self, text: str) -> list[str]:
+        """Chunk text into words via pre-tokenization"""
+        if self.special_token_pat is not None:
+            docs = re.split(self.special_token_pat, text)
+        else:
+            docs = [text]
+
+        word_list = []
+        for doc in docs:
+            # don't split up special tokens
+            if doc in self.special_tokens:
+                word_list.append(doc)
+                continue
+            matches = re.finditer(self.pre_tok_pat, doc)
+            for match in matches:
+                word = doc[match.start():match.end()]
+                word_list.append(word)
+
+        return word_list
+
+    def _merge_word_once(self, tokens: list[bytes]) -> list[bytes]:
+        high_score = float('inf')
+        best_bytepair = (None, None)
+        for i, (b0, b1) in enumerate(zip(tokens, tokens[1:])):
+            score = self.rank_pair.get((b0,b1), float('inf'))
+            if score < high_score:
+                high_score = score
+                best_bytepair = (b0, b1)
+
+        # no merge found
+        if high_score == float('inf'):
+            return tokens
+
+        out_toks = []
+        i = 0
+        while i < len(tokens):
+            if i < len(tokens) - 1 and \
+               tokens[i] == best_bytepair[0] and \
+               tokens[i+1] == best_bytepair[1]:
+                # combine
+                out_toks.append(tokens[i] + tokens[i+1])
+                i+=1
+            else:
+                out_toks.append(tokens[i])
+            i+=1
+        
+        return out_toks
+
+    def encode(self, text: str) -> list[int]:
+        word_list: list[str] = self._words(text)
+        # cache of words we already know how to merge
+        # word_merges: dict[str, tuple[bytes, ...]] = dict()
+        word_toks: dict[str, list[int]] = dict()
+
+        encoding = []
+        for word in word_list:
+
+            # handle special tokens
+            if word in self.special_tokens:
+                special_bytes = word.encode("utf-8")
+                encoding.extend([self.bytes_to_int[special_bytes]])
+                continue
+
+            elif word not in word_toks.keys():
+                # Continuously merge until no merges left
+                # _merge_word_once is set up to return the input == output
+                # if no merges can take place
+                word_bytes = [bytes([b]) for b in word.encode()]
+                next_bytes = self._merge_word_once(word_bytes)
+                while next_bytes != word_bytes:
+                    word_bytes = next_bytes
+                    next_bytes = self._merge_word_once(word_bytes)
+
+                # bytes -> ints
+                word_toks[word] = [self.bytes_to_int[b] for b in next_bytes]
+
+            # add to output
+            encoding.extend(word_toks[word])
+
+        return encoding
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for chunk in iterable:
+            yield from self.encode(chunk)
+
+    def decode(self, ids: list[int]) -> str:
+        out = []
+        for id in ids:
+            out.append(self.vocab[id])
+        return b"".join(out).decode("utf-8", errors="replace")
 
 class Linear(nn.Module):
     def __init__(self, in_feat, out_feat, device=None, dtype=None):
@@ -205,13 +326,14 @@ class MultiHeadAttention(nn.Module):
         qkv = qkv.reshape((B, seq, self.d_model))
         return torch.einsum("d m, b s m -> b s d", self.O, qkv)
 
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+def softmax(x: torch.Tensor, dim: int, temperature:float=1) -> torch.Tensor:
     """
     softmax(v) = exp(v_i) / sum(exp(v_j))
     """
     # Subtract a constant for stability
     dim_max = torch.amax(x, dim, keepdim=True)
     x = x - dim_max
+    x /= temperature
 
     exp = torch.exp(x)
     return exp / torch.sum(exp, dim=dim, keepdim=True)
@@ -371,7 +493,7 @@ def get_lr_cosine_schedule(
         # post annealing
         return amin
 
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> None:
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, eps: float = 1e-6) -> float:
     parameters = list(parameters)
     # Calculate the l2 norm of "g" the concat of all p.grad
     with torch.no_grad():
@@ -384,7 +506,7 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
 
         # Do nothing
         if norm < max_l2_norm:
-            return
+            return norm
 
         # Clip the grads
         scale = max_l2_norm / (norm + eps)
@@ -393,6 +515,8 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
                 continue
             p.grad *= scale
 
+    return norm
+
 def load(x: np.ndarray, batch: int, ctx: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     starts = torch.randint(0, len(x) - ctx, (batch,1)) # (batch,1)
     offsets = torch.arange(0, ctx).unsqueeze(0) # (1,ctx)
@@ -400,3 +524,17 @@ def load(x: np.ndarray, batch: int, ctx: int, device: str) -> tuple[torch.Tensor
     in_seq = torch.from_numpy(x[idxs]).to(device)
     out_seq = torch.from_numpy(x[idxs+1]).to(device)
     return (in_seq, out_seq)
+
+def save_checkpoint(model: torch.nn.Module, optimizer:torch.optim.Optimizer, iteration: int, out: str) -> None:
+    out_dict = {
+        "model" : model.state_dict(),
+        "optimizer" : optimizer.state_dict(),
+        "iter" : iteration
+    }
+    torch.save(out_dict, out)
+
+def load_checkpoint(src: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> int:
+    pkl = torch.load(src, weights_only=False)
+    model.load_state_dict(pkl["model"])
+    optimizer.load_state_dict(pkl["optimizer"])
+    return pkl["iter"]

@@ -30,6 +30,9 @@ from cs336_basics.modules import (
     get_lr_cosine_schedule,
     gradient_clipping,
     load,
+    save_checkpoint,
+    load_checkpoint,
+    Tokenizer
 )
 
 def run_linear(
@@ -648,7 +651,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -669,7 +672,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(
@@ -692,7 +695,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def _process_chunk(input_path, start, end, special_tokens, pre_tok_pat, special_token_pat):
