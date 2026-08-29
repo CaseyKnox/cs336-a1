@@ -11,7 +11,7 @@ from typing import Optional, Iterator
 from dataclasses import dataclass, asdict
 
 class Tokenizer:
-    def __init__(self, vocab, merges, special_tokens: list[str] | None = None):
+    def __init__(self, vocab: dict[int, bytes], merges:list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
         """
         vocab: dict[int, bytes] 
         merges: list[tuple[bytes, bytes]]
