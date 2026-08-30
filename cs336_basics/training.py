@@ -5,6 +5,7 @@ import time
 import regex as re
 import os
 import multiprocessing as mp
+import itertools
 from collections import defaultdict
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from tqdm import tqdm
@@ -15,33 +16,17 @@ from cs336_basics.modules import (
     gradient_clipping,
     get_lr_cosine_schedule,
     softmax,
-    Tokenizer
+    Tokenizer,
+    LM,
+    AdamW,
 )
+from dataclasses import asdict
+import tyro
+from cs336_basics.params import Params
 
-from dataclasses import dataclass, asdict
-
-@dataclass
-class HyperParams:
-    steps: int
-    lr: float
-    batch: int
-    ctx: int
-    checkpoint_pth: str
-    device: str = 'mps'
-    log_every: int = 10
-    checkpoint_every: int = 100
-    validation_every: int = 100
-    train_val_split: float = 0.9
-    max_l2_norm: float = 1.0
-    amax: float = 6e-4
-    amin: float = 6e-5
-    t_warm: int = 100
-    t_c: int = 1000
-    wandb_mode: str = 'offline'
-
-def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p: HyperParams, tokenizer: Tokenizer | None = None):
+def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p: Params, tokenizer: Tokenizer | None = None):
     # init
-    memmap = np.memmap(data_path, dtype=np.int64, mode='r')
+    memmap = np.memmap(data_path, dtype=np.uint16, mode='r')
     split_idx = int(p.train_val_split * len(memmap))
     train_data = memmap[:split_idx]
     val_data = memmap[split_idx:]
@@ -89,9 +74,9 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
             "epoch" : epoch,
             "grad_norm" : unclipped_norm,
         } 
-        if step % p.checkpoint_every == 0:
+        if step % p.checkpoint_every == 0 and step != 0:
             save_checkpoint(model, optimizer, step, build_path(p.checkpoint_pth, step))
-        if step % p.validation_every == 0:
+        if step % p.validation_every == 0 and step != 0:
             with torch.no_grad():
                 x_val, targets_val = load(val_data, p.batch, p.ctx, p.device)
                 logits = model(x_val)
@@ -100,7 +85,7 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
                 # Generate some text for qualitative analysis
                 if tokenizer is not None:
                     prompt = "Once upon a time"
-                    emb = torch.Tensor(tokenizer.encode(prompt), device=p.device)
+                    emb = torch.tensor(tokenizer.encode(prompt), device=p.device, dtype=torch.long)
                     out_toks = generate(model, emb, max_gen=100)
                     gen = tokenizer.decode(out_toks.cpu().tolist())
 
@@ -160,7 +145,7 @@ def generate(
             logits = model(tokens_tensor) # (batch, seq, vocab_size)
             logits = logits[0, -1, :] # discard batch and other words in the seq
             dist = softmax(logits, -1, temperature) # (vocab_size)
-            dist_idxs = torch.arange(0, len(dist))
+            dist_idxs = torch.arange(0, len(dist), device=device)
             if top_p is not None:
                 dist_idxs = torch.argsort(dist, descending=True)
                 cumsum = torch.cumsum(dist[dist_idxs], -1)
@@ -197,6 +182,7 @@ def _process_chunk(input_path, start, end, special_tokens, pre_tok_pat, special_
             pre_tok[tuple([bytes([i]) for i in tok_enc])] += 1
 
     return pre_tok
+
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -208,7 +194,7 @@ def train_bpe(
     special_tokens_esc = [re.escape(tok) for tok in special_tokens]
     special_token_pat = f"({'|'.join(special_tokens_esc)})"
 
-    n_proc = mp.cpu_count() - 2
+    n_proc = mp.cpu_count()
     print(f"Running with {n_proc} processes")
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, n_proc, special_tokens[0].encode("utf-8"))
@@ -225,7 +211,7 @@ def train_bpe(
             for start, end in zip(boundaries, boundaries[1:])
         ]
         # 1. pre-tokenization
-        with mp.Pool(n_proc - 1) as p:
+        with mp.Pool(n_proc - 2) as p:
             res = p.starmap(_process_chunk, chunk_args)
         
         # merge pre-tok dictionaries
@@ -300,47 +286,88 @@ def train_bpe(
     vocab_dict = {i : v for i, v in enumerate(vocab)}
     return vocab_dict, merges
 
-if __name__ == "__main__":
-    from argparse import ArgumentParser
-    argparse = ArgumentParser()
-    argparse.add_argument("--input-text", default="data/TinyStoriesV2-GPT4-train.txt")
-    argparse.add_argument("--vocab-path", default="vocab_dict.pkl")
-    argparse.add_argument("--merges-path", default="merges.pkl")
-    argparse.add_argument("--vocab-size", default=10_000)
-    argparse.add_argument("--special-tokens", nargs="+", default=["<|endoftext|>"])
-    argparse.add_argument("--ctx-len", default=256)
-    argparse.add_argument("--num-layers", default=4)
-    argparse.add_argument("--d-model", default=512)
-    args = argparse.parse_args()
+def _tokenize_chunk(input_path, start, end, tokenizer: Tokenizer):
+    """
+    Read in a short chunk and tokenize it!
+    """
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    return tokenizer.encode(chunk)
 
-    params = HyperParams(
-        steps=0,
-        lr=0,
-        batch=1,
-        ctx=args.ctx_len,
-        checkpoint_pth=".",
-    )
+def tokenize_file(input_text: str, out: str, vocab_dict, merges, special_tokens):
+    """
+    input_text: .txt path where the input text is stored
+    out: path to save the encoded input text file
+    vocab_dict: tokenization scheme from {int : bytes}
+    merges: list[tuple[bytes, bytes]] to merge
+    special_tokens: e.g. <|endoftext|>
+    """
+    tokenizer = Tokenizer(vocab_dict, merges, special_tokens)
+
+    n_proc = mp.cpu_count() - 2
+    with open(input_text, "rb") as f:
+        boundaries = find_chunk_boundaries(f, n_proc, special_tokens[0].encode("utf-8"))
+
+    print(f"Found {len(boundaries)} boundaries")
+
+    chunk_args = [
+        (input_text, start, end, Tokenizer(vocab_dict, merges, special_tokens))
+        for start, end in zip(boundaries, boundaries[1:])
+    ]
+    t0 = time.time()
+    with mp.Pool(n_proc - 2) as p:
+        res = p.starmap(_tokenize_chunk, chunk_args)
+    tokens = list(itertools.chain.from_iterable(res))
+    print(f"Tokenized {os.path.getsize(input_text):0.2f} MB in {time.time() - t0:.2f}s")
+
+    print(f"Saving encoded text to {out}")
+    tokens_np = np.array(tokens, dtype=np.uint16)
+    tokens_np.tofile(out)
+
+if __name__ == "__main__":
+    # Parse args into the Params dataclass
+    args = tyro.cli(Params)
 
     if not os.path.exists(args.vocab_path) or not os.path.exists(args.merges_path):
         print(f"{args.vocab_path} or {args.merges_path} not found.")
-        print(f"Training BPE")
+        print("Training BPE")
         vocab_dict, merges = train_bpe(args.input_text, args.vocab_size, args.special_tokens)
         print(f"Saving to {args.vocab_path}\nand {args.merges_path}")
         torch.save(vocab_dict, args.vocab_path)
         torch.save(merges, args.merges_path)
     else:
-        print(f"Loading vocab + merges from cache")
+        print("Loading vocab + merges from cache")
         vocab_dict = torch.load(args.vocab_path)
         merges = torch.load(args.merges_path)
 
     # Create tokenizer
     tokenizer = Tokenizer(vocab_dict, merges, args.special_tokens)
 
+    # Tokenize the training data
+    if not os.path.exists(args.input_text_encoded):
+        print(f"{args.input_text_encoded} was not found")
+        print(f"Encoding entire text file...")
+        tokenize_file(args.input_text, args.input_text_encoded, vocab_dict, merges, args.special_tokens)
 
     # Create Model
-    from modules import LM
-    LM(args.vocab_size, args.ctx_len, )
+    model = LM(
+        vocab_size=args.vocab_size,
+        max_seq_len=args.ctx,
+        n_layers=args.num_layers,
+        d_model=args.d_model,
+        n_heads=args.num_heads,
+        d_ff=args.d_ff,
+        theta=args.theta,
+        device=args.device,
+    )
 
-    # Run training
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay, # what does this do?
+        betas=(args.beta1, args.beta2),
+        eps=args.eps
+    )
 
-    train()
+    train(model, optimizer, args.input_text_encoded, args, tokenizer)

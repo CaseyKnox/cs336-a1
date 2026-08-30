@@ -167,3 +167,5 @@ data/*
 
 *.prof
 *tmp.py*
+wandb*
+*.pt

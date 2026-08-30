@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import math
 import regex as re
+import time
 
 from jaxtyping import Bool, Float, Int
 from collections.abc import Callable, Iterable
@@ -31,10 +32,8 @@ class Tokenizer:
 
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None) -> "Tokenizer":
-        with open(vocab_filepath, "r") as f:
-            vocab = f.read()
-        with open(merges_filepath, "r") as f:
-            merges = f.read()
+        vocab = torch.load(vocab_filepath)
+        merges = torch.load(merges_filepath)
         return Tokenizer(vocab, merges, special_tokens)
 
     def _words(self, text: str) -> list[str]:
@@ -152,7 +151,7 @@ class Embedding(nn.Module):
         """
         token_ids: maps from word to vocab index. shaped (batch_size, sequence_length)
         """
-        assert (token_ids > 0).all()
+        assert (token_ids >= 0).all()
         assert token_ids.dtype == torch.int64, f"token_ids has type {token_ids.dtype} != int"
         return self.embedding[token_ids] # (batch, sequence_len, emb_dim)
 
@@ -181,7 +180,7 @@ class RMSNorm(nn.Module):
         x = x.to(torch.float32) # upcast for stability
 
         denom = einops.reduce(torch.pow(x, 2), "b s d -> b s 1", "sum") / self.d_model # (B, S, 1)
-        denom += self.eps
+        denom = denom + self.eps
         denom = torch.sqrt(denom)
 
         # Element-wise multiplication
@@ -232,8 +231,8 @@ class RoPE(nn.Module):
         thetas = torch.einsum("i, j -> i j", positions, freqs) # (max_seq_len, d//2)
         thetas = thetas.repeat_interleave(2, dim=-1) # (max_seq_len, d)
 
-        self.register_buffer("cos", torch.cos(thetas), persistent=False)
-        self.register_buffer("sin", torch.sin(thetas), persistent=False)
+        self.register_buffer("cos", torch.cos(thetas).to(device), persistent=False)
+        self.register_buffer("sin", torch.sin(thetas).to(device), persistent=False)
     
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -332,8 +331,7 @@ def softmax(x: torch.Tensor, dim: int, temperature:float=1) -> torch.Tensor:
     """
     # Subtract a constant for stability
     dim_max = torch.amax(x, dim, keepdim=True)
-    x = x - dim_max
-    x /= temperature
+    x = (x - dim_max) / temperature
 
     exp = torch.exp(x)
     return exp / torch.sum(exp, dim=dim, keepdim=True)
@@ -349,8 +347,8 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Pre norm
-        x += self.attn(self.rms(x)) # use rope
-        x += self.swiglu(self.rms2(x))
+        x = x + self.attn(self.rms(x)) # use rope
+        x = x + self.swiglu(self.rms2(x))
         return x
 
 class LM(nn.Module):
@@ -373,7 +371,7 @@ class LM(nn.Module):
         self.emb = Embedding(vocab_size, d_model, device, dtype)
         self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff, theta, max_seq_len, device, dtype) for _ in range(n_layers)])
         self.norm = RMSNorm(d_model, device=device, dtype=dtype)
-        self.linear = Linear(d_model, vocab_size)
+        self.linear = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.emb(x) # (B, S, D)
@@ -419,7 +417,7 @@ class AdamW(torch.optim.Optimizer):
         if lr < 0:
             raise ValueError(f"Invalid alpha: {lr}")
         defaults = {
-            "a" : lr,
+            "lr" : lr,
             "b1" : betas[0],
             "b2" : betas[1],
             "eps" : eps,
@@ -430,7 +428,7 @@ class AdamW(torch.optim.Optimizer):
     def step(self, closure: Optional[Callable] = None):
         loss = None if closure is None else closure()
         for group in self.param_groups:
-            a = group["a"]
+            a = group["lr"]
             b1 = group["b1"]
             b2 = group["b2"]
             eps = group["eps"]
@@ -518,11 +516,11 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
     return norm
 
 def load(x: np.ndarray, batch: int, ctx: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
-    starts = torch.randint(0, len(x) - ctx, (batch,1)) # (batch,1)
+    starts = torch.randint(0, len(x) - ctx, (batch, 1)) # (batch,1)
     offsets = torch.arange(0, ctx).unsqueeze(0) # (1,ctx)
     idxs = (starts + offsets).to(torch.int) # (batch,ctx)
-    in_seq = torch.from_numpy(x[idxs]).to(device)
-    out_seq = torch.from_numpy(x[idxs+1]).to(device)
+    in_seq = torch.from_numpy(x[idxs]).to(device).to(torch.int64)
+    out_seq = torch.from_numpy(x[idxs+1]).to(device).to(torch.int64)
     return (in_seq, out_seq)
 
 def save_checkpoint(model: torch.nn.Module, optimizer:torch.optim.Optimizer, iteration: int, out: str) -> None:
@@ -531,7 +529,10 @@ def save_checkpoint(model: torch.nn.Module, optimizer:torch.optim.Optimizer, ite
         "optimizer" : optimizer.state_dict(),
         "iter" : iteration
     }
+    print(f"Saving checkpoint to {out}")
+    t0 = time.time()
     torch.save(out_dict, out)
+    print(f"Checkpoint saved in {time.time() - t0:.2f}s")
 
 def load_checkpoint(src: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> int:
     pkl = torch.load(src, weights_only=False)

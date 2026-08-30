@@ -33,6 +33,7 @@ from cs336_basics.modules import (
     load_checkpoint,
     Tokenizer
 )
+from cs336_basics.training import train_bpe
 
 def run_linear(
     d_in: int,
