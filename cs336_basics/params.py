@@ -17,13 +17,11 @@ class Params:
     theta: float = 10000.0
 
     # Optimization & learning rate schedule
-    batch: int = 16
-    steps: int = 20000
-    lr: float = 5.0e-4
+    batch: int = 32
+    steps: int = 5000 # 20_000
     amax: float = 5.0e-4
-    amin: float = 5.0e-5
-    t_warm: int = 1000
-    t_c: int = 20000
+    amin: float = 5.0e-5 # 0.1 * amax
+    t_warm: int = 100 # 1000 # should be 1-5% of steps
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95

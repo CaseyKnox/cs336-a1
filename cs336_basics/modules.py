@@ -132,7 +132,8 @@ class Linear(nn.Module):
         super().__init__()
 
         self.weights = nn.Parameter(torch.empty(out_feat, in_feat, device=device, dtype=dtype))
-        self.weights = nn.init.trunc_normal_(self.weights)
+        std = 2 / (in_feat + out_feat)
+        self.weights = nn.init.trunc_normal_(self.weights, std=std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return einops.einsum(x, self.weights, "... d_in, ... d_out d_in -> ... d_out")

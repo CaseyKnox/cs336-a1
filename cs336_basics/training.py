@@ -27,14 +27,23 @@ from cs336_basics.params import Params
 def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p: Params, tokenizer: Tokenizer | None = None):
     # init
     memmap = np.memmap(data_path, dtype=np.uint16, mode='r')
-    split_idx = int(p.train_val_split * len(memmap))
+    max_data = 40_000_000
+    # max_data = len(memmap)
+    split_idx = int(p.train_val_split * max_data)
     train_data = memmap[:split_idx]
-    val_data = memmap[split_idx:]
+    val_data = memmap[split_idx:max_data]
+
+    # mini
+    # max_data = p.batch * p.ctx # One batch
+    # train_data = memmap[:max_data]
+    # val_data = memmap[:max_data]
+    # print(f"{len(memmap)} tokens available. Using {max_data} tokens")
 
     wandb.init(
         project="cs336-assignment1",
         config=asdict(p),
-        mode=p.wandb_mode
+        mode=p.wandb_mode,
+        group="lr_sweep"
     )
 
     for step in tqdm(range(p.steps)):
@@ -51,11 +60,10 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
         loss.backward()
         unclipped_norm = gradient_clipping(model.parameters(), p.max_l2_norm)
 
+        lr = get_lr_cosine_schedule(step, p.amax, p.amin, p.t_warm, p.steps)
+        optimizer.param_groups[0]['lr'] = lr
         optimizer.step()
         optimizer.zero_grad()
-        curr_lr = optimizer.param_groups[0]['lr']
-        lr = get_lr_cosine_schedule(step, p.amax, p.amin, p.t_warm, p.t_c)
-        optimizer.param_groups[0]['lr'] = lr
 
         # Sync + log
         if torch.mps.is_available():
@@ -68,7 +76,7 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
         w_val = {}
         w = {
             "train/loss" : loss.item(),
-            "train/lr" : curr_lr, 
+            "train/lr" : lr, 
             "train/tps" : tps,
             "tokens_seen" : tokens_seen,
             "epoch" : epoch,
@@ -350,24 +358,33 @@ if __name__ == "__main__":
         print(f"Encoding entire text file...")
         tokenize_file(args.input_text, args.input_text_encoded, vocab_dict, merges, args.special_tokens)
 
-    # Create Model
-    model = LM(
-        vocab_size=args.vocab_size,
-        max_seq_len=args.ctx,
-        n_layers=args.num_layers,
-        d_model=args.d_model,
-        n_heads=args.num_heads,
-        d_ff=args.d_ff,
-        theta=args.theta,
-        device=args.device,
-    )
+    # LR sweep
+    max_lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
+    for max_lr in max_lrs:
+        # Create Model
+        model = LM(
+            vocab_size=args.vocab_size,
+            max_seq_len=args.ctx,
+            n_layers=args.num_layers,
+            d_model=args.d_model,
+            n_heads=args.num_heads,
+            d_ff=args.d_ff,
+            theta=args.theta,
+            device=args.device,
+        )
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay, # what does this do?
-        betas=(args.beta1, args.beta2),
-        eps=args.eps
-    )
+        optimizer = AdamW(
+            model.parameters(),
+            lr=0.0, # init
+            weight_decay=args.weight_decay, # what does this do?
+            betas=(args.beta1, args.beta2),
+            eps=args.eps
+        )
 
-    train(model, optimizer, args.input_text_encoded, args, tokenizer)
+        # train(model, optimizer, args.input_text_encoded, args, tokenizer)
+
+        max_lr = max_lr
+        amin = 0.1 * max_lr
+        args.amin = amin
+        args.amax = max_lr
+        train(model, optimizer, args.input_text_encoded, args, tokenizer)
