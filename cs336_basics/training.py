@@ -33,11 +33,20 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
     train_data = memmap[:split_idx]
     val_data = memmap[split_idx:max_data]
 
+    if p.data_in_memory:
+        print(f"keeping data in memory")
+        train_data = torch.from_numpy(train_data).to(p.device).to(torch.int64)
+        val_data = torch.from_numpy(val_data).to(p.device).to(torch.int64)
+
     # mini
     # max_data = p.batch * p.ctx # One batch
     # train_data = memmap[:max_data]
     # val_data = memmap[:max_data]
     # print(f"{len(memmap)} tokens available. Using {max_data} tokens")
+
+    # compile model
+    if p.compile_model:
+        model = torch.compile(model, backend="aot_eager")
 
     wandb.init(
         project="cs336-assignment1",

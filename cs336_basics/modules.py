@@ -152,8 +152,8 @@ class Embedding(nn.Module):
         """
         token_ids: maps from word to vocab index. shaped (batch_size, sequence_length)
         """
-        assert (token_ids >= 0).all()
-        assert token_ids.dtype == torch.int64, f"token_ids has type {token_ids.dtype} != int"
+        # assert (token_ids >= 0).all()
+        # assert token_ids.dtype == torch.int64, f"token_ids has type {token_ids.dtype} != int"
         return self.embedding[token_ids] # (batch, sequence_len, emb_dim)
 
 class RMSNorm(nn.Module):
@@ -290,7 +290,7 @@ class MultiHeadAttention(nn.Module):
         x torch.Tensor: input of shape (B, seq, d_model)
         """
         B, seq, dm = x.shape
-        assert dm == self.d_model, f"input tensor does not have appropriate last dim: {dm} != {self.d_model}"
+        # assert dm == self.d_model, f"input tensor does not have appropriate last dim: {dm} != {self.d_model}"
 
         # m = d_model
         # d = d_model
@@ -516,17 +516,22 @@ def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: flo
 
     return norm
 
-def load(x: np.ndarray, batch: int, ctx: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+def load(x: np.ndarray | torch.Tensor, batch: int, ctx: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     starts = torch.randint(0, len(x) - ctx, (batch, 1)) # (batch,1)
     offsets = torch.arange(0, ctx).unsqueeze(0) # (1,ctx)
     idxs = (starts + offsets).to(torch.int) # (batch,ctx)
-    in_seq = torch.from_numpy(x[idxs]).to(device).to(torch.int64)
-    out_seq = torch.from_numpy(x[idxs+1]).to(device).to(torch.int64)
+    if type(x) == torch.Tensor:
+        idxs = idxs.to(device)
+        in_seq = x[idxs]
+        out_seq = x[idxs+1]
+    else:
+        in_seq = torch.from_numpy(x[idxs]).to(device).to(torch.int64)
+        out_seq = torch.from_numpy(x[idxs+1]).to(device).to(torch.int64)
     return (in_seq, out_seq)
 
 def save_checkpoint(model: torch.nn.Module, optimizer:torch.optim.Optimizer, iteration: int, out: str) -> None:
     out_dict = {
-        "model" : model.state_dict(),
+        "model" : getattr(model, "_orig_mod", model).state_dict(),
         "optimizer" : optimizer.state_dict(),
         "iter" : iteration
     }
