@@ -17,10 +17,9 @@ class Params:
     theta: float = 10000.0
 
     # Optimization & learning rate schedule
-    batch: int = 16
-    steps: int = 10_000 # 20_000
-    amax: float = 5.0e-4
-    amin: float = 5.0e-5 # 0.1 * amax
+    batch: int = 64
+    steps: int = 2500 # 20_000
+    lr: float = 5.0e-4
     t_warm: int = 100 # 1000 # should be 1-5% of steps
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -41,5 +40,11 @@ class Params:
     validation_every: int = 100
     train_val_split: float = 0.9
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
-    data_in_memory: bool = False # whether to keep data loaded in memory
-    compile_model: bool = False
+    wandb_group: str | None = None
+    wandb_name: str | None = None
+    data_in_memory: bool = True # whether to keep data loaded in memory
+    compile_model: bool = True
+
+    # Experiments
+    lr_sweep: bool = False
+    batch_sweep: bool = False

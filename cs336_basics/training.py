@@ -34,7 +34,7 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
     val_data = memmap[split_idx:max_data]
 
     if p.data_in_memory:
-        print(f"keeping data in memory")
+        print(f"keeping data in memory on device {p.device}")
         train_data = torch.from_numpy(train_data).to(p.device).to(torch.int64)
         val_data = torch.from_numpy(val_data).to(p.device).to(torch.int64)
 
@@ -46,13 +46,17 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
 
     # compile model
     if p.compile_model:
-        model = torch.compile(model, backend="aot_eager")
+        if torch.backends.mps.is_available():
+            model = torch.compile(model, backend="aot_eager")
+        else:
+            model = torch.compile(model)
 
     wandb.init(
         project="cs336-assignment1",
         config=asdict(p),
         mode=p.wandb_mode,
-        group="lr_sweep"
+        group=p.wandb_group,
+        name=p.wandb_name
     )
 
     for step in tqdm(range(p.steps)):
@@ -61,6 +65,8 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
 
         if torch.mps.is_available():
             torch.mps.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
         start = time.perf_counter()
 
         # 2. Forward & Backward pass
@@ -69,7 +75,9 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
         loss.backward()
         unclipped_norm = gradient_clipping(model.parameters(), p.max_l2_norm)
 
-        lr = get_lr_cosine_schedule(step, p.amax, p.amin, p.t_warm, p.steps)
+        amax = p.lr
+        amin = 0.1 * p.lr
+        lr = get_lr_cosine_schedule(step, amax, amin, p.t_warm, p.steps)
         optimizer.param_groups[0]['lr'] = lr
         optimizer.step()
         optimizer.zero_grad()
@@ -77,6 +85,8 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
         # Sync + log
         if torch.mps.is_available():
             torch.mps.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         tps = p.batch * p.ctx / elapsed
         tokens_seen = (step + 1) * p.batch * p.ctx
@@ -103,7 +113,7 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
                 if tokenizer is not None:
                     prompt = "Once upon a time"
                     emb = torch.tensor(tokenizer.encode(prompt), device=p.device, dtype=torch.long)
-                    out_toks = generate(model, emb, max_gen=100)
+                    out_toks = generate(model, emb, max_gen=100, device=p.device, end_token="<|endoftext|>")
                     gen = tokenizer.decode(out_toks.cpu().tolist())
 
                     # Create wandb table and log
@@ -342,6 +352,75 @@ def tokenize_file(input_text: str, out: str, vocab_dict, merges, special_tokens)
     tokens_np = np.array(tokens, dtype=np.uint16)
     tokens_np.tofile(out)
 
+def run_lr_sweep(args, tokenizer):
+    # max_lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
+    max_lrs = [5e-2, 1e-1, 5e-1]
+    for max_lr in max_lrs:
+        max_lr = max_lr
+        args.lr = max_lr
+        args.wandb_group = f"lr_sweep"
+        args.wandb_name = f"lr_{max_lr}"
+        print(f"="*50)
+        print(f"Running learning rate sweep with max_lr: {max_lr}")
+        print(f"="*50)
+
+        # Create Model
+        model = LM(
+            vocab_size=args.vocab_size,
+            max_seq_len=args.ctx,
+            n_layers=args.num_layers,
+            d_model=args.d_model,
+            n_heads=args.num_heads,
+            d_ff=args.d_ff,
+            theta=args.theta,
+            device=args.device,
+        )
+
+        optimizer = AdamW(
+            model.parameters(),
+            lr=0.0, # init
+            weight_decay=args.weight_decay, # what does this do?
+            betas=(args.beta1, args.beta2),
+            eps=args.eps
+        )
+
+        # train(model, optimizer, args.input_text_encoded, args, tokenizer)
+
+        train(model, optimizer, args.input_text_encoded, args, tokenizer)
+
+def run_batch_sweep(args, tokenizer):
+    batch_sizes = [1, 16, 32, 64, 128]
+    for batch_size in batch_sizes:
+        args.batch = batch_size
+        args.steps = 160_000 // batch_size
+        args.wandb_group = f"batch_sweep"
+        args.wandb_name = f"batch_{batch_size}"
+        print(f"="*50)
+        print(f"Running batch sweep with batch size: {batch_size} and steps: {args.steps}")
+        print(f"="*50)
+
+        # Create Model
+        model = LM(
+            vocab_size=args.vocab_size,
+            max_seq_len=args.ctx,
+            n_layers=args.num_layers,
+            d_model=args.d_model,
+            n_heads=args.num_heads,
+            d_ff=args.d_ff,
+            theta=args.theta,
+            device=args.device,
+        )
+
+        optimizer = AdamW(
+            model.parameters(),
+            lr=0.0, # init
+            weight_decay=args.weight_decay, # what does this do?
+            betas=(args.beta1, args.beta2),
+            eps=args.eps
+        )
+
+        train(model, optimizer, args.input_text_encoded, args, tokenizer)
+
 if __name__ == "__main__":
     # Parse args into the Params dataclass
     args = tyro.cli(Params)
@@ -367,10 +446,11 @@ if __name__ == "__main__":
         print(f"Encoding entire text file...")
         tokenize_file(args.input_text, args.input_text_encoded, vocab_dict, merges, args.special_tokens)
 
-    # LR sweep
-    max_lrs = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
-    for max_lr in max_lrs:
-        # Create Model
+    if args.batch_sweep:
+        run_batch_sweep(args, tokenizer)
+    elif args.lr_sweep:
+        run_lr_sweep(args, tokenizer)
+    else:
         model = LM(
             vocab_size=args.vocab_size,
             max_seq_len=args.ctx,
@@ -389,11 +469,4 @@ if __name__ == "__main__":
             betas=(args.beta1, args.beta2),
             eps=args.eps
         )
-
-        # train(model, optimizer, args.input_text_encoded, args, tokenizer)
-
-        max_lr = max_lr
-        amin = 0.1 * max_lr
-        args.amin = amin
-        args.amax = max_lr
         train(model, optimizer, args.input_text_encoded, args, tokenizer)
