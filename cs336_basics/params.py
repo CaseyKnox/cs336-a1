@@ -19,7 +19,7 @@ class Params:
     # Optimization & learning rate schedule
     batch: int = 64
     steps: int = 2500 # 20_000
-    lr: float = 5.0e-4
+    lr: float = 1.0e-2
     t_warm: int = 100 # 1000 # should be 1-5% of steps
     weight_decay: float = 0.1
     beta1: float = 0.9

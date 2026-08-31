@@ -475,13 +475,7 @@ def calc_total_memory(b,h,s,d,d_f,v,n):
     total = calculate_activations(b,h,s,d,d_f,v,n) + calc_params(d,d_f,v,n) + calc_grads(d,d_f,v,n) + calc_optim(d,d_f,v,n)
     return total
 
-def get_lr_cosine_schedule(
-    t: int,
-    amax: float,
-    amin: float,
-    t_warm: int,
-    t_c: int,
-):
+def get_lr_cosine_schedule(t: int, amax: float, amin: float, t_warm: int, t_c: int):
     # warm-up
     if t < t_warm:
         return t / t_warm * amax

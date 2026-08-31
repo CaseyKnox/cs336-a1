@@ -130,6 +130,10 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data_path, p
 
         wandb.log(w | w_val, step=step)
 
+        # Break the training loop if batch_sweep is enabled and we've completed one epoch
+        if p.batch_sweep and epoch >= 1:
+            break
+
     wandb.finish()
 
 
@@ -392,11 +396,11 @@ def run_batch_sweep(args, tokenizer):
     batch_sizes = [1, 16, 32, 64, 128]
     for batch_size in batch_sizes:
         args.batch = batch_size
-        args.steps = 160_000 // batch_size
+        args.steps = 160_000
         args.wandb_group = f"batch_sweep"
         args.wandb_name = f"batch_{batch_size}"
         print(f"="*50)
-        print(f"Running batch sweep with batch size: {batch_size} and steps: {args.steps}")
+        print(f"Running batch sweep with batch size: {batch_size}")
         print(f"="*50)
 
         # Create Model
